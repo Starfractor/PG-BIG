@@ -13,6 +13,7 @@ import utils.losses as losses
 import utils.utils_model as utils_model
 import warnings
 from dataset import dataset_183_retarget
+from dataset import dataset_addbiomechanics
 from models.evaluator_wrapper import EvaluatorModelWrapper
 from options.get_eval_option import get_opt
 from torch.utils.tensorboard import SummaryWriter
@@ -51,26 +52,8 @@ def main():
     writer = SummaryWriter(args.out_dir)
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
-    if args.dataname == '183_subjects':
-        args.nb_joints = 91
-    elif args.dataname == '183_retargeted':
+    if args.dataname == '183_athletes':
         args.nb_joints = 37
-    elif args.dataname == 'addb':
-        args.nb_joints = 23
-
-    logger.info(f'Training on {args.dataname}, motions are with {args.nb_joints} joints')
-
-
-    if args.dataname == '183_subjects':
-        train_loader = dataset_183_athletes.subject183_data_loader(
-            base_directory='/home/mnt/datasets/183_subjects',
-            window_size=args.window_size,
-            batch_size=args.batch_size,
-            num_workers=4,
-            preload=True
-        )
-        train_loader_iter = dataset_183_athletes.cycle(train_loader)
-    elif args.dataname == '183_retargeted':
         train_loader = dataset_183_retarget.retargeted183_data_loader(
             window_size=args.window_size,
             unit_length=2**args.down_t,
@@ -80,14 +63,20 @@ def main():
             pre_load=True
         )
         train_loader_iter = dataset_183_retarget.cycle(train_loader)
-    else:
-        train_loader = dataset_MOT_segmented.addb_data_loader(
+    elif args.dataname == 'addbiomechanics':
+        args.nb_joints = 23
+        train_loader = dataset_addbiomechanics.addb_data_loader(
             window_size=args.window_size,
             unit_length=2**args.down_t,
             batch_size=args.batch_size,
             mode='train',
             data_dir='/home/mnt/AddBiomechanics'
         )
+    else:
+        logger.error(f"Invalid dataset name: {args.dataname}")
+        raise ValueError(f"Dataset '{args.dataname}' is not supported.")
+
+    logger.info(f'Training on {args.dataname}, motions are with {args.nb_joints} joints')
 
     # Setup VQ-VAE model
     net = vqvae.HumanVQVAE(
@@ -190,7 +179,7 @@ def main():
 
     # Training Loop
     avg_recons, avg_perplexity, avg_commit, avg_temporal = 0., 0., 0., 0.
-    torch.save({'net' : net.state_dict()}, os.path.join(args.out_dir, 'warmup.pth'))
+    torch.save({'net' : net.state_dict(), 'args' : args}, os.path.join(args.out_dir, 'warmup.pth'))
     for nb_iter in range(1, args.total_iter + 1):
         gt_motion, len_motion, _, _ = next(train_loader_iter)
         gt_motion = gt_motion.to(device).float() 
@@ -226,7 +215,7 @@ def main():
             avg_recons, avg_perplexity, avg_commit, avg_temporal = 0., 0., 0., 0.
 
         if nb_iter % (10 * args.eval_iter) == 0:
-            torch.save({'net' : net.state_dict()}, os.path.join(args.out_dir, str(nb_iter) + '.pth'))
+            torch.save({'net' : net.state_dict(), 'args' : args}, os.path.join(args.out_dir, str(nb_iter) + '.pth'))
 
 if __name__ == "__main__":
     main()
