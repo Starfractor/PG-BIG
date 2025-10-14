@@ -12,11 +12,12 @@ def get_args_parser():
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
 
     ## optimization
-    parser.add_argument('--total-iter', default=200000, type=int, help='number of total iterations to run')
+    parser.add_argument('--total-iter', default=100000, type=int, help='number of total iterations to run')
     parser.add_argument('--warm-up-iter', default=1000, type=int, help='number of total iterations for warmup')
     parser.add_argument('--lr', default=2e-4, type=float, help='max learning rate')
     parser.add_argument('--lr-scheduler', default=[50000, 400000], nargs="+", type=int, help="learning rate schedule (iterations)")
     parser.add_argument('--gamma', default=0.05, type=float, help="learning rate decay")
+    parser.add_argument("--temporal", type=float, default=2, help="hyper-parameter for the temporal loss")
 
     parser.add_argument('--weight-decay', default=0.0, type=float, help='weight decay')
     parser.add_argument("--commit", type=float, default=0.02, help="hyper-parameter for the commitment loss")
@@ -46,7 +47,7 @@ def get_args_parser():
     
     
     ## output directory 
-    parser.add_argument('--out-dir', type=str, default='output_vqfinal/', help='output directory')
+    parser.add_argument('--out-dir', type=str, default='outputs_vqfinal/', help='output directory')
     parser.add_argument('--results-dir', type=str, default='visual_results/', help='output directory')
     parser.add_argument('--visual-name', type=str, default='baseline', help='output directory')
     parser.add_argument('--exp-name', type=str, default='exp_debug', help='name of the experiment, will create a file inside out-dir')

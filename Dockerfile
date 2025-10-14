@@ -31,6 +31,13 @@ RUN conda env create -f environment.yaml && \
     conda clean -afy && \
     rm -rf /root/.cache/pip
 
+# Copy environment files and create conda environments
+COPY environment.yaml opencap-processing.yaml .
+RUN conda env create -f environment.yaml && \
+    conda env create -f opencap-processing.yaml && \
+    conda clean -afy && \
+    rm -rf /root/.cache/pip
+
 # Set environment variables for conda
 SHELL ["conda", "run", "-n", "BIGE", "/bin/bash", "-c"]
 

@@ -1,0 +1,33 @@
+name: PG-BIG
+channels:
+  - defaults
+  - nvidia
+  - pytorch
+  - conda-forge
+dependencies:
+  - cudatoolkit
+  - ezc3d
+  - imageio
+  - ipykernel
+  - jupyter
+  - matplotlib
+  - notebook
+  - numpy==1.23.5
+  - openpyxl
+  - pandas
+  - pip
+  - python=3.8
+  - scikit-learn
+  - scipy
+  - spacy
+  - tensorboard
+  - umap-learn
+  - pip:
+      - chumpy
+      - deepspeed
+      - git+https://github.com/openai/CLIP.git
+      - moviepy
+      - nimblephysics
+      - smplx
+      - transformers
+      - xgboost

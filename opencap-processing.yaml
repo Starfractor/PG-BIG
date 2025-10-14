@@ -1,0 +1,28 @@
+name: opencap-processing
+channels:
+  - opensim-org
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - opensim
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - jupyter
+  - notebook
+  - ipython
+  - ipykernel
+  - cmake
+  - libopenblas
+  - pyyaml
+  - joblib
+  - pip
+  - pip:
+      - requests
+      - casadi
+      - ezc3d
+      - moviepy
+      - python-decouple
+      - maskpass==0.3.6

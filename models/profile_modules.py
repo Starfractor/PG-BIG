@@ -39,7 +39,6 @@ class ProfileEncoder(nn.Module):
 
         x_latent = self.latent_proj(x)
 
-
         if biomech is not None:
             x_bio = self.biomech_proj(biomech)
         else:
@@ -50,29 +49,54 @@ class ProfileEncoder(nn.Module):
         profile = self.head(x_cat)
         return profile
 
-class ProfileDecoder(nn.Module):
-    def __init__(self, profile_dim, codebook_dim, seq_len, num_actions, n_layers=2, n_heads=4):
+class ProfileActionToMotionTransformer(nn.Module):
+    def __init__(self, profile_dim, codebook_dim, seq_len, action_emb_dim, n_layers=2, n_heads=4):
         super().__init__()
         self.seq_len = seq_len
         self.codebook_dim = codebook_dim
         self.profile_proj = nn.Linear(profile_dim, codebook_dim)
-        self.action_proj = nn.Linear(num_actions, codebook_dim)
+        # action_emb_dim is the dimensionality of a learned action embedding
+        # (we expect an nn.Embedding produces these vectors). Project that
+        # into the codebook latent space.
+        self.action_proj = nn.Linear(action_emb_dim, codebook_dim)
+        # --- CHANGED: Add fusion MLP for profile+action ---
+        self.fusion = nn.Sequential(
+            nn.Linear(codebook_dim * 2, codebook_dim),
+            nn.GELU()
+        )
         self.pos_emb = nn.Parameter(torch.randn(seq_len, codebook_dim))
-        decoder_layer = nn.TransformerDecoderLayer(d_model=codebook_dim, nhead=n_heads)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=codebook_dim, nhead=n_heads, dropout=0.1)
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
-        self.out_proj = nn.Linear(codebook_dim, codebook_dim)
+        self.norm = nn.LayerNorm(codebook_dim)
+        self.out_proj = nn.Sequential(
+            nn.Linear(codebook_dim, codebook_dim),
+            nn.Dropout(0.1)
+        )
 
-    def forward(self, profile, action_onehot):
+    def forward(self, profile, action_emb):
+        """
+        Args:
+            profile: (B, profile_dim)
+            action_emb: (B, action_emb_dim) - learned action embeddings (not one-hot)
+        """
         B = profile.size(0)
         profile_emb = self.profile_proj(profile)
-        action_emb = self.action_proj(action_onehot)
-        combined = profile_emb + action_emb  # (B, codebook_dim)
-        combined = combined.unsqueeze(1)
-        tgt = self.pos_emb.unsqueeze(0).repeat(B, 1, 1)
-        tgt = tgt + combined
+        # project incoming action embedding into codebook space
+        action_emb = self.action_proj(action_emb)
+        # Fuse profile and action embeddings
+        combined = self.fusion(torch.cat([profile_emb, action_emb], dim=-1))  # (B, codebook_dim)
+        combined = self.norm(combined)
+        combined = combined.unsqueeze(1)  # (B, 1, codebook_dim)
+        
+        # Create target sequence with positional embeddings
+        tgt = self.pos_emb.unsqueeze(0).repeat(B, 1, 1)  # (B, seq_len, codebook_dim)
+        tgt = tgt + combined  
+        
+        # Transformer expects (seq_len, B, dim)
         tgt = tgt.transpose(0, 1)
         memory = combined.transpose(0, 1)
-        out = self.transformer(tgt, memory)
-        out = self.out_proj(out)
-        out = out.transpose(0, 1)
+        
+        out = self.transformer(tgt, memory)  # (seq_len, B, codebook_dim)
+        out = out.transpose(0, 1)  # (B, seq_len, codebook_dim)
+        out = self.out_proj(out)  # Apply output projection to the final sequence
         return out

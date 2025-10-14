@@ -2,7 +2,7 @@ import deepspeed
 import json
 import models.vqvae as vqvae
 import nimblephysics as nimble
-import options.option_vq as option_vq
+import options.option_vqvae as option_vqvae
 import os
 import torch
 import torch.distributed as dist
@@ -15,7 +15,6 @@ import warnings
 from dataset import dataset_183_retarget
 from dataset import dataset_addbiomechanics
 from models.evaluator_wrapper import EvaluatorModelWrapper
-from options.get_eval_option import get_opt
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from utils.word_vectorizer import WordVectorizer
@@ -30,7 +29,7 @@ def update_lr_warm_up(optimizer, nb_iter, warm_up_iter, lr):
 
 def main():
     # --- Robust device and distributed/deepspeed setup ---
-    args = option_vq.get_args_parser()
+    args = option_vqvae.get_args_parser()
     torch.manual_seed(args.seed)
 
     args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -96,7 +95,17 @@ def main():
     if args.resume_pth : 
         logger.info('loading checkpoint from {}'.format(args.resume_pth))
         ckpt = torch.load(args.resume_pth, map_location=device)
-        net.load_state_dict(ckpt['net'], strict=True)
+        # Accept either a raw state_dict or a wrapped checkpoint containing the state dict under 'net'
+        sd = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt
+        # If saved from DataParallel the keys may be prefixed with 'module.' — strip that
+        if isinstance(sd, dict):
+            new_sd = {}
+            for k, v in sd.items():
+                new_k = k[len('module.'):] if k.startswith('module.') else k
+                new_sd[new_k] = v
+            sd = new_sd
+        # Load only the weight tensors (state_dict)
+        net.load_state_dict(sd, strict=True)
     net.train()
     net.to(device)
 
@@ -151,7 +160,7 @@ def main():
                         f"loss_commit={loss_commit.item()}, "
                         f"loss_temp={loss_temp.item()}")
             continue
-        loss = loss_motion + args.commit * loss_commit + 0.5 * loss_temp 
+        loss = loss_motion + args.commit * loss_commit + args.temporal * loss_temp 
 
         if not torch.isfinite(loss):
             logger.error(f"NaN or Inf detected in loss at iter {nb_iter}")
@@ -179,7 +188,7 @@ def main():
 
     # Training Loop
     avg_recons, avg_perplexity, avg_commit, avg_temporal = 0., 0., 0., 0.
-    torch.save({'net' : net.state_dict(), 'args' : args}, os.path.join(args.out_dir, 'warmup.pth'))
+    torch.save({'net': net.state_dict(), 'args': vars(args)}, os.path.join(args.out_dir, 'warmup.pth'))
     for nb_iter in range(1, args.total_iter + 1):
         gt_motion, len_motion, _, _ = next(train_loader_iter)
         gt_motion = gt_motion.to(device).float() 
@@ -187,7 +196,7 @@ def main():
         pred_motion, loss_commit, perplexity = net(gt_motion)
         loss_motion = Loss(pred_motion, gt_motion)
         loss_temp = torch.mean((pred_motion[:,1:,:]-pred_motion[:,:-1,:])**2)
-        loss = loss_motion + args.commit * loss_commit + 0.5 * loss_temp 
+        loss = loss_motion + args.commit * loss_commit + args.temporal * loss_temp 
         
         optimizer.zero_grad()
         loss.backward()
@@ -215,7 +224,7 @@ def main():
             avg_recons, avg_perplexity, avg_commit, avg_temporal = 0., 0., 0., 0.
 
         if nb_iter % (10 * args.eval_iter) == 0:
-            torch.save({'net' : net.state_dict(), 'args' : args}, os.path.join(args.out_dir, str(nb_iter) + '.pth'))
+            torch.save({'net': net.state_dict(), 'args': vars(args)}, os.path.join(args.out_dir, str(nb_iter) + '.pth'))
 
 if __name__ == "__main__":
     main()
