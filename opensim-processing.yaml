@@ -1,4 +1,4 @@
-name: test1
+name: opensim-processing
 channels:
   - conda-forge
   - opensim-org
