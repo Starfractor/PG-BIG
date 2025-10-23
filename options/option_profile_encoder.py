@@ -8,9 +8,9 @@ def get_args_parser():
     )
 
     # Data and experiment
-    parser.add_argument('--dataset-path', type=str, default='./dataset/183_retargeted', help='Path to the dataset')
-    parser.add_argument('--checkpoint-path', type=str, default='./output/VQVAE/300000.pth', help='Path to VQ-VAE checkpoint')
-    parser.add_argument('--exp-name', type=str, default='profile_encoder', help='Experiment name for saving results')
+    parser.add_argument('--dataset-path', type=str, default='/home/mnt/datasets/183_retargeted', help='Path to the dataset')
+    parser.add_argument('--checkpoint-path', type=str, default='./outputs/VQVAE/300000.pth', help='Path to VQ-VAE checkpoint')
+    parser.add_argument('--exp-name', type=str, default='profile_encoder_meta', help='Experiment name for saving results')
     parser.add_argument('--out-dir', type=str, default='outputs/', help='Output directory for experiment results')
 
     # Training

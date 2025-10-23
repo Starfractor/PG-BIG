@@ -1,4 +1,4 @@
-name: PG-BIG
+name: pg-big
 channels:
   - defaults
   - nvidia

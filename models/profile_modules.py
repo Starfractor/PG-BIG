@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ProfileEncoder(nn.Module):
-    def __init__(self, latent_dim=37, profile_dim=128, bio_out_dim=64, biomech_dim=2048):
+    def __init__(self, latent_dim=37, profile_dim=128, bio_out_dim=64, biomech_dim=2048, metadata_dim=128, metadata_out_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
         self.bio_out_dim = bio_out_dim
@@ -21,15 +21,21 @@ class ProfileEncoder(nn.Module):
             nn.GELU()
         )
 
+        self.metadata_proj = nn.Sequential(
+            nn.Linear(metadata_dim, self.metadata_out_dim),
+            nn.LayerNorm(self.metadata_out_dim),
+            nn.GELU()
+        )
+
         self.attn_pool = nn.Linear(latent_dim, 1)
 
-        in_dim = 128 + self.bio_out_dim
+        in_dim = 128 + self.bio_out_dim + self.metadata_out_dim
         self.head = nn.Sequential(
             nn.Linear(in_dim, profile_dim),
             nn.LayerNorm(profile_dim)
         )
 
-    def forward(self, latents, biomech=None):
+    def forward(self, latents, biomech=None, metadata=None):
         if latents.dim() == 3:
             attn_logits = self.attn_pool(latents)
             attn_weights = torch.softmax(attn_logits, dim=1)
@@ -45,7 +51,13 @@ class ProfileEncoder(nn.Module):
             x_bio = torch.zeros(x_latent.size(0), self.bio_out_dim,
                                 device=x_latent.device, dtype=x_latent.dtype)
 
-        x_cat = torch.cat([x_latent, x_bio], dim=-1)
+        if metadata is not None:
+            x_metadata = self.metadata_proj(metadata)
+        else:
+            x_metadata = torch.zeros(x_latent.size(0), self.metadata_out_dim,
+                                    device=x_latent.device, dtype=x_latent.dtype)
+
+        x_cat = torch.cat([x_latent, x_bio, x_metadata], dim=-1)
         profile = self.head(x_cat)
         return profile
 
@@ -54,23 +66,36 @@ class ProfileActionToMotionTransformer(nn.Module):
         super().__init__()
         self.seq_len = seq_len
         self.codebook_dim = codebook_dim
-        self.profile_proj = nn.Linear(profile_dim, codebook_dim)
+        # small projection with activation and dropout to reduce overfitting
+        self.profile_proj = nn.Sequential(
+            nn.Linear(profile_dim, codebook_dim),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
         # action_emb_dim is the dimensionality of a learned action embedding
         # (we expect an nn.Embedding produces these vectors). Project that
         # into the codebook latent space.
-        self.action_proj = nn.Linear(action_emb_dim, codebook_dim)
-        # --- CHANGED: Add fusion MLP for profile+action ---
+        self.action_proj = nn.Sequential(
+            nn.Linear(action_emb_dim, codebook_dim),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        # fusion MLP with residual connection + LayerNorm
         self.fusion = nn.Sequential(
             nn.Linear(codebook_dim * 2, codebook_dim),
-            nn.GELU()
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(codebook_dim, codebook_dim),
         )
+        self.fusion_ln = nn.LayerNorm(codebook_dim)
         self.pos_emb = nn.Parameter(torch.randn(seq_len, codebook_dim))
-        decoder_layer = nn.TransformerDecoderLayer(d_model=codebook_dim, nhead=n_heads, dropout=0.1)
+        # increase dropout in transformer layers to help regularize
+        decoder_layer = nn.TransformerDecoderLayer(d_model=codebook_dim, nhead=n_heads, dropout=0.2)
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(codebook_dim)
         self.out_proj = nn.Sequential(
             nn.Linear(codebook_dim, codebook_dim),
-            nn.Dropout(0.1)
+            nn.Dropout(0.2)
         )
 
     def forward(self, profile, action_emb):
@@ -83,9 +108,9 @@ class ProfileActionToMotionTransformer(nn.Module):
         profile_emb = self.profile_proj(profile)
         # project incoming action embedding into codebook space
         action_emb = self.action_proj(action_emb)
-        # Fuse profile and action embeddings
-        combined = self.fusion(torch.cat([profile_emb, action_emb], dim=-1))  # (B, codebook_dim)
-        combined = self.norm(combined)
+        # Fuse profile and action embeddings with residual + layernorm
+        fused = self.fusion(torch.cat([profile_emb, action_emb], dim=-1))
+        combined = self.fusion_ln(fused + profile_emb)
         combined = combined.unsqueeze(1)  # (B, 1, codebook_dim)
         
         # Create target sequence with positional embeddings

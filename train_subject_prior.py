@@ -99,7 +99,7 @@ def get_action_index(action, action_to_idx):
     """Return integer index for action or None if unknown."""
     return action_to_idx.get(action, None)
 
-def compute_loss_and_acc(batch_profiles, batch_action_emb, batch_latents, mapping_net, model, ce_loss, code_embed_dim, lengths=None):
+def compute_loss_and_acc(batch_profiles, batch_action_emb, batch_latents, mapping_net, model, ce_loss, code_embed_dim, lengths=None, use_embedding_loss=False):
     """
     Compute loss and accuracy for the decoder with support for variable-length sequences.
     
@@ -134,30 +134,60 @@ def compute_loss_and_acc(batch_profiles, batch_action_emb, batch_latents, mappin
     
     # Get codebook and compute logits
     codebook = model.vqvae.quantizer.codebook.to(pred_latents.device)  # (num_codes, code_embed_dim)
+    # Sanity check: predicted latent dimension must match codebook embedding dim
+    if pred_latents.shape[-1] != codebook.shape[1]:
+        raise RuntimeError(f"Dimension mismatch: pred_latents dim {pred_latents.shape[-1]} != codebook emb dim {codebook.shape[1]}")
     logits = F.linear(pred_latents, codebook)  # (B, max_seq_len, num_codes)
     
     # Create mask for variable-length sequences
     if lengths is not None:
         # Create mask: (B, max_seq_len)
         mask = torch.arange(max_seq_len, device=pred_latents.device).unsqueeze(0) < lengths.unsqueeze(1)
-        
-        # Compute masked loss
-        logits_transpose = logits.transpose(1, 2)  # (B, num_codes, max_seq_len)
-        loss_per_token = F.cross_entropy(logits_transpose, batch_code_indices, reduction='none')  # (B, max_seq_len)
-        masked_loss = (loss_per_token * mask.float()).sum() / mask.float().sum()
-        loss = masked_loss
-        
-        # Compute masked accuracy
-        with torch.no_grad():
-            pred_idx = logits.argmax(dim=-1)  # (B, max_seq_len)
-            correct = (pred_idx == batch_code_indices).float() * mask.float()
-            acc = correct.sum().item() / mask.float().sum().item()
+
+        if use_embedding_loss:
+            # Build target embeddings from code indices and compute MSE per token
+            # code_indices is (B*max_seq_len,)
+            target_embs_flat = codebook[code_indices.long()].to(pred_latents.device)  # (B*max_seq_len, emb_dim)
+            target_embs = target_embs_flat.view(B, max_seq_len, -1)  # (B, max_seq_len, emb_dim)
+            # MSE per position (keep per-dim reduction=None to average dims later)
+            loss_per_pos = F.mse_loss(pred_latents, target_embs, reduction='none')  # (B, max_seq_len, emb_dim)
+            loss_per_token = loss_per_pos.mean(dim=-1)  # (B, max_seq_len)
+            masked_loss = (loss_per_token * mask.float()).sum() / mask.float().sum()
+            loss = masked_loss
+
+            # Compute masked accuracy using discrete nearest-code evaluation
+            with torch.no_grad():
+                logits = F.linear(pred_latents, codebook)  # (B, max_seq_len, num_codes)
+                pred_idx = logits.argmax(dim=-1)
+                correct = (pred_idx == batch_code_indices).float() * mask.float()
+                acc = correct.sum().item() / mask.float().sum().item()
+        else:
+            # Compute masked loss using cross-entropy over discrete code indices
+            logits_transpose = logits.transpose(1, 2)  # (B, num_codes, max_seq_len)
+            loss_per_token = F.cross_entropy(logits_transpose, batch_code_indices, reduction='none')  # (B, max_seq_len)
+            masked_loss = (loss_per_token * mask.float()).sum() / mask.float().sum()
+            loss = masked_loss
+
+            # Compute masked accuracy
+            with torch.no_grad():
+                pred_idx = logits.argmax(dim=-1)  # (B, max_seq_len)
+                correct = (pred_idx == batch_code_indices).float() * mask.float()
+                acc = correct.sum().item() / mask.float().sum().item()
     else:
-        # Original behavior without masking
-        loss = ce_loss(logits.transpose(1, 2), batch_code_indices)
-        with torch.no_grad():
-            pred_idx = logits.argmax(dim=-1)
-            acc = (pred_idx == batch_code_indices).float().mean().item()
+        # No masking (all sequences same length)
+        if use_embedding_loss:
+            target_embs_flat = codebook[code_indices.long()].to(pred_latents.device)  # (B*max_seq_len, emb_dim)
+            target_embs = target_embs_flat.view(B, max_seq_len, -1)
+            loss = F.mse_loss(pred_latents, target_embs)
+            with torch.no_grad():
+                logits = F.linear(pred_latents, codebook)
+                pred_idx = logits.argmax(dim=-1)
+                acc = (pred_idx == batch_code_indices).float().mean().item()
+        else:
+            loss = ce_loss(logits.transpose(1, 2), batch_code_indices)
+            with torch.no_grad():
+                pred_idx = logits.argmax(dim=-1)
+                acc = (pred_idx == batch_code_indices).float().mean().item()
     
     return loss, acc
 
@@ -185,7 +215,7 @@ def get_train_batch(batch_idx, train_profiles, train_action_indices, train_laten
     batch_latents = torch.stack(padded_latents).to(device)
     return batch_profiles, batch_action_idx, batch_latents, lengths
 
-def evaluate_validation(val_profiles, val_action_indices, val_latents, batch_size, mapping_net, action_embedding, model, ce_loss, code_embed_dim):
+def evaluate_validation(val_profiles, val_action_indices, val_latents, batch_size, mapping_net, action_embedding, model, ce_loss, code_embed_dim, use_embedding_loss=False):
     """Evaluate using integer action indices and an nn.Embedding module with variable-length support.
 
     val_action_indices: list of int indices aligned with val_profiles/val_latents
@@ -223,7 +253,7 @@ def evaluate_validation(val_profiles, val_action_indices, val_latents, batch_siz
             batch_latents = torch.stack(padded_latents).to(batch_profiles.device)
             
             loss, acc = compute_loss_and_acc(batch_profiles, batch_actions, batch_latents, 
-                                            mapping_net, model, ce_loss, code_embed_dim, lengths=lengths)
+                                            mapping_net, model, ce_loss, code_embed_dim, lengths=lengths, use_embedding_loss=use_embedding_loss)
             
             # Weight by number of actual tokens
             num_tokens = lengths.sum().item()
@@ -233,6 +263,60 @@ def evaluate_validation(val_profiles, val_action_indices, val_latents, batch_siz
             
         val_loss = val_loss_sum / max(1, total_tokens)
         val_acc = val_acc_sum / max(1, total_tokens)
+    # Additional per-action breakdown for diagnostics
+    # Build mapping from action_idx -> list of sample indices
+    action_to_indices = {}
+    for i, aidx in enumerate(val_action_indices):
+        action_to_indices.setdefault(aidx, []).append(i)
+
+    per_action_stats = {}
+    for aidx, idx_list in action_to_indices.items():
+        # build a small batch for this action (may do multiple batches if large)
+        # We'll compute average loss/acc across all tokens for this action
+        action_loss_sum = 0.0
+        action_acc_sum = 0.0
+        action_tokens = 0
+        for start in range(0, len(idx_list), batch_size):
+            sub_idx = idx_list[start:start+batch_size]
+            batch_profiles = torch.stack([val_profiles[j] for j in sub_idx])
+            batch_idx = torch.tensor([val_action_indices[j] for j in sub_idx], dtype=torch.long, device=batch_profiles.device)
+            batch_actions = action_embedding(batch_idx)
+
+            lengths = torch.tensor([val_latents[j].shape[1] for j in sub_idx], dtype=torch.long, device=batch_profiles.device)
+            max_len = lengths.max().item()
+            padded_latents = []
+            for j in sub_idx:
+                lat = val_latents[j]
+                if lat.shape[1] < max_len:
+                    pad_len = max_len - lat.shape[1]
+                    padded = F.pad(lat, (0, pad_len), mode='constant', value=0)
+                else:
+                    padded = lat
+                padded_latents.append(padded)
+            batch_latents = torch.stack(padded_latents).to(batch_profiles.device)
+
+            loss, acc = compute_loss_and_acc(batch_profiles, batch_actions, batch_latents,
+                                            mapping_net, model, ce_loss, code_embed_dim, lengths=lengths)
+            num_tokens = lengths.sum().item()
+            action_loss_sum += loss.item() * num_tokens
+            action_acc_sum += acc * num_tokens
+            action_tokens += num_tokens
+
+        if action_tokens > 0:
+            per_action_stats[aidx] = {
+                'loss': action_loss_sum / action_tokens,
+                'acc': action_acc_sum / action_tokens,
+                'count': len(idx_list)
+            }
+
+    # Print top 10 worst actions by loss for quick diagnostics
+    if len(per_action_stats) > 0:
+        sorted_actions = sorted(per_action_stats.items(), key=lambda x: x[1]['loss'], reverse=True)
+        print("\nTop validation actions by loss (action_idx -> loss, acc, count):")
+        for aidx, stats in sorted_actions[:10]:
+            act_name = aidx if isinstance(aidx, int) else str(aidx)
+            print(f"  {act_name} -> loss={stats['loss']:.4f}, acc={stats['acc']:.4f}, count={stats['count']}")
+
     mapping_net.train()
     return val_loss, val_acc
 
@@ -455,6 +539,24 @@ def main():
     if len(val_profiles) == 0:
         print("Warning: No validation samples (all actions unseen). Validation will be skipped.")
 
+    # Diagnostic: report action overlap between train and val
+    val_action_set = set([action_list[idx] for idx in val_action_indices]) if len(val_action_indices) > 0 else set()
+    train_action_set = set(action_list)
+    overlap = train_action_set & val_action_set
+    print(f"Train actions: {len(train_action_set)}, Val actions: {len(val_action_set)}, Overlap: {len(overlap)}")
+
+    # Diagnostic: sequence length distributions
+    import collections
+    train_len_counts = collections.Counter([lat.shape[1] for lat in train_latents])
+    val_len_counts = collections.Counter([lat.shape[1] for lat in val_latents]) if len(val_latents) > 0 else collections.Counter()
+    print("Train sequence length distribution (len:count) sample: ")
+    for l, c in list(train_len_counts.items())[:10]:
+        print(f"  {l}: {c}")
+    if len(val_len_counts) > 0:
+        print("Val sequence length distribution (len:count) sample: ")
+        for l, c in list(val_len_counts.items())[:10]:
+            print(f"  {l}: {c}")
+
     # Determine actual dimensions from the stored latents
     sample_latent_shape = train_latents[0].shape
     print(f"Sample training latent shape: {sample_latent_shape}")
@@ -506,11 +608,19 @@ def main():
 
     # Learned action embeddings
     action_embedding = nn.Embedding(num_actions, action_emb_dim).to(device)
-    dec_optimizer = torch.optim.AdamW(mapping_net.parameters(), lr=1e-3, weight_decay=1e-4)
+    # include action_embedding parameters in optimizer so they're trained with weight decay
+    dec_optimizer = torch.optim.AdamW(
+        list(mapping_net.parameters()) + list(action_embedding.parameters()),
+        lr=1e-3, weight_decay=1e-4
+    )
+    # Scheduler to reduce LR on plateau (validation loss)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(dec_optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     ce_loss = nn.CrossEntropyLoss()
     num_samples = len(train_profiles)
     indices = np.arange(num_samples)
     all_losses = []
+    val_losses = []
+    best_val = float('inf')
 
     for epoch in range(num_epochs_decoder):
         np.random.shuffle(indices)
@@ -527,37 +637,66 @@ def main():
             # Convert integer indices to learned embeddings
             batch_action_emb = action_embedding(batch_action_idx)
 
+            use_embedding_loss = getattr(args, 'use_embedding_loss', False)
             loss, acc = compute_loss_and_acc(
                 batch_profiles, batch_action_emb, batch_latents,
-                mapping_net, model, ce_loss, actual_code_dim, lengths=lengths
+                mapping_net, model, ce_loss, actual_code_dim, lengths=lengths, use_embedding_loss=use_embedding_loss
             )
             dec_optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(mapping_net.parameters(), max_norm=5.0)
             dec_optimizer.step()
 
-            bs = batch_profiles.size(0)
-            epoch_loss += loss.item() * bs
-            epoch_acc += acc * bs
-            total += bs
+            # Weight epoch metrics by the number of actual tokens (not just samples)
+            # compute_loss_and_acc returns a per-token average when lengths is provided,
+            # so multiply by the number of tokens to accumulate correctly (matching validation).
+            num_tokens = lengths.sum().item()
+            epoch_loss += loss.item() * num_tokens
+            epoch_acc += acc * num_tokens
+            total += num_tokens
 
         epoch_loss /= max(1, total)
         epoch_acc /= max(1, total)
         all_losses.append(epoch_loss)
+        # Run validation every epoch so scheduler and early stopping can act
+        if len(val_profiles) > 0:
+            use_embedding_loss = getattr(args, 'use_embedding_loss', False)
+            val_loss, val_acc = evaluate_validation(
+                val_profiles, val_action_indices, val_latents, batch_size,
+                mapping_net, action_embedding, model, ce_loss, actual_code_dim, use_embedding_loss=use_embedding_loss
+            )
+        else:
+            val_loss, val_acc = None, None
 
-        if (epoch + 1) % 100 == 0 or epoch == 0:
-            # Prepare validation batches (convert indices to embeddings on the fly)
-            if len(val_profiles) > 0:
-                val_loss, val_acc = evaluate_validation(
-                    val_profiles, val_action_indices, val_latents, batch_size,
-                    mapping_net, action_embedding, model, ce_loss, actual_code_dim
-                )
-            else:
-                val_loss, val_acc = None, None
-            msg = f"Decoder Epoch {epoch+1}/{num_epochs_decoder} | Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | PPL: {np.exp(epoch_loss):.2f}"
-            if val_loss is not None:
-                msg += f" || Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val PPL: {np.exp(val_loss):.2f}"
-            print(msg)
+        # Scheduler steps using validation loss; save best checkpoint when improved.
+        if val_loss is not None:
+            scheduler.step(val_loss)
+            val_losses.append(val_loss)
+            if val_loss < best_val - 1e-6:
+                best_val = val_loss
+                # save best checkpoint (weights + embedding + mapping)
+                best_path = os.path.join(args.out_dir, 'profile_decoder_best.pth')
+                torch.save({
+                    'net': mapping_net.state_dict(),
+                    'action_embedding': action_embedding.state_dict(),
+                    'action_list': action_list,
+                    'action_to_idx': action_to_idx,
+                    'decoder_args': {
+                        'profile_dim': profile_dim,
+                        'code_dim': actual_code_dim,
+                        'seq_len': actual_seq_len,
+                        'action_emb_dim': action_emb_dim,
+                        'num_actions': num_actions
+                    }
+                }, best_path)
+
+        msg = f"Decoder Epoch {epoch+1}/{num_epochs_decoder} | Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | PPL: {np.exp(epoch_loss):.2f}"
+        if val_loss is not None:
+            msg += f" || Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val PPL: {np.exp(val_loss):.2f}"
+        print(msg)
+
+    if getattr(args, 'use_embedding_loss', False):
+        print("Note: Decoder was trained using embedding-MSE loss (use_embedding_loss=True). Validation metrics still compute discrete accuracy via nearest-code.")
 
     print("Decoder training complete.")
     
@@ -583,6 +722,7 @@ def main():
         'action_list': action_list,
         'action_to_idx': action_to_idx,
         'decoder_args': decoder_args,       # Add explicit decoder architecture params
+        'use_embedding_loss': getattr(args, 'use_embedding_loss', False),
         'args': vars(args)
     }
     torch.save(checkpoint, decoder_save_path)

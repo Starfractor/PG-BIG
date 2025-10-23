@@ -1,0 +1,21 @@
+name: test1
+channels:
+  - conda-forge
+  - opensim-org
+dependencies:
+  - casadi
+  - ezc3d
+  - ipykernel
+  - matplotlib
+  - numpy<2
+  - opensim=4.5.0
+  - pandas
+  - pip
+  - python=3.11
+  - pyyaml
+  - scipy
+  - pip:
+      - maskpass==0.3.6
+      - nimblephysics  
+      - python-decouple
+      - requests

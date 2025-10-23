@@ -45,46 +45,108 @@ def get_biomech_vector(subject, dataset, biomech_dim, args=None):
         else:
             vec = vec[:biomech_dim]
     return vec
+sport_list = set()
+level_list = set()
+injury_types = set()
 
-def sample_triplet(subjects, subject_samples, biomech_dim, device, dataset, args=None):
-    biomech_dim = _use_arg(args, 'biomech_dim', biomech_dim)
-    device = _use_arg(args, 'device', device)
+def get_metadata_vector(subject):
+    """Create metadata one-hot encodings for ProfileEncoder from subject metadata"""
+    metadata = loader.dataset.subject_metadata.get(subject, {})
+
+    # Encode categorical features as one-hot
+    age = metadata.get('age', 'unknown')
+    height = metadata.get('height', 'unknown')
+    mass = metadata.get('mass', 'unknown')
+
+    sex = metadata.get('sex', 'unknown')
+    sport = metadata.get('sport', 'unknown')
+    level = metadata.get('level', 'unknown')
+    injuries = metadata.get('injuries', [])
+    
+    # Sex encoding (one-hot: male, female, unknown)
+    sex_encoding = [1.0, 0.0, 0.0] if sex == 'male' else [0.0, 1.0, 0.0] if sex == 'female' else [0.0, 0.0, 1.0]
+    
+    # Sport encoding (one-hot for common sports)
+
+    sport_encoding = [1.0 if sport == s else 0.0 for s in sport_list]
+
+    level_encoding = [1.0 if level == l else 0.0 for l in level_list]
+    
+
+    
+    # Filter out NaN values and ensure injuries is a list of strings
+    if injuries is None or (isinstance(injuries, float) and np.isnan(injuries)):
+        injuries = []
+    elif not isinstance(injuries, list):
+        injuries = []
+    
+    # Convert all injury entries to strings and filter out NaN values
+ 
+    injury_encoding = [0.0] * len(injury_types)
+    for injury in injuries:
+        if injury is not None and not (isinstance(injury, float) and np.isnan(injury)):
+            injury_encoding[inj_idx[injury]] += 1.0
+            
+    
+    # Combine all one-hot encodings
+    metadata_onehot = np.array([
+        age,
+        height,
+        mass,
+        *sex_encoding,
+        *sport_encoding, 
+        *level_encoding,
+        *injury_encoding
+    ], dtype=np.float32)
+    
+    return metadata_onehot
+
+
+def sample_triplet(subjects, subject_latents, biomech_dim, device):
     subject_pos = np.random.choice(subjects)
-    latents_pos = [l for l, _ in subject_samples[subject_pos]]
+    latents_pos = subject_latents[subject_pos]
     if len(latents_pos) < 2:
         return None
     idx = np.random.choice(len(latents_pos), 2, replace=False)
     anchor = latents_pos[idx[0]].unsqueeze(0).to(device)
     positive = latents_pos[idx[1]].unsqueeze(0).to(device)
-    negative_subjects = [s for s in subjects if s != subject_pos and len(subject_samples[s]) > 0]
+    negative_subjects = [s for s in subjects if s != subject_pos and len(subject_latents[s]) > 0]
     if not negative_subjects:
         return None
     subject_neg = np.random.choice(negative_subjects)
-    latents_neg = [l for l, _ in subject_samples[subject_neg]]
+    latents_neg = subject_latents[subject_neg]
     negative = latents_neg[np.random.choice(len(latents_neg))].unsqueeze(0).to(device)
-    a_bio = get_biomech_vector(subject_pos, dataset, biomech_dim, args=args)
-    p_bio = a_bio.copy()
-    n_bio = get_biomech_vector(subject_neg, dataset, biomech_dim, args=args)
-    return anchor, positive, negative, a_bio, p_bio, n_bio
+    
+    # FIXED: Return consistent number of values - only metadata indices for ProfileEncoder
+    a_metadata = get_metadata_vector(subject_pos)
+    p_metadata = a_metadata.copy()
+    n_metadata = get_metadata_vector(subject_neg)
 
-def create_batch(batch_size, subjects, subject_samples, biomech_dim, device, dataset, args=None):
-    batch_size = _use_arg(args, 'batch_size', batch_size)
-    biomech_dim = _use_arg(args, 'biomech_dim', biomech_dim)
-    device = _use_arg(args, 'device', device)
+    a_bio = get_biomech_vector(subject_pos)
+    p_bio = a_bio.copy()
+    n_bio = get_biomech_vector(subject_neg)
+    
+    return anchor, positive, negative, a_metadata, p_metadata, n_metadata, a_bio, p_bio, n_bio
+
+def create_batch(batch_size, subjects, subject_latents, biomech_dim, device):
     anchors, positives, negatives = [], [], []
+    anchor_metadatas, positive_metadatas, negative_metadatas = [], [], []
     anchor_bios, positive_bios, negative_bios = [], [], []
     for _ in range(batch_size):
-        result = sample_triplet(subjects, subject_samples, biomech_dim, device, dataset, args=args)
+        result = sample_triplet(subjects, subject_latents, biomech_dim, device)
         if result is None:
             continue
-        anchor, positive, negative, a_bio, p_bio, n_bio = result
+        anchor, positive, negative, a_metadata, p_metadata, n_metadata, a_bio, p_bio, n_bio = result
         anchors.append(anchor)
         positives.append(positive)
         negatives.append(negative)
+        anchor_metadatas.append(a_metadata)
+        positive_metadatas.append(p_metadata)
+        negative_metadatas.append(n_metadata)
         anchor_bios.append(a_bio)
         positive_bios.append(p_bio)
         negative_bios.append(n_bio)
-    return anchors, positives, negatives, anchor_bios, positive_bios, negative_bios
+    return anchors, positives, negatives, anchor_metadatas, positive_metadatas, negative_metadatas, anchor_bios, positive_bios, negative_bios
 
 def compute_triplet_accuracy(anchor_emb, positive_emb, negative_emb):
     pos_sim = F.cosine_similarity(anchor_emb, positive_emb)
@@ -96,7 +158,7 @@ def evaluate(encoder, subjects, subject_samples, biomech_dim, device, dataset, b
     biomech_dim = _use_arg(args, 'biomech_dim', biomech_dim)
     device = _use_arg(args, 'device', device)
     encoder.eval()
-    anchors, positives, negatives, anchor_bios, positive_bios, negative_bios = create_batch(
+    anchors, positives, negatives, anchor_metadatas, positive_metadatas, negative_metadatas, anchor_bios, positive_bios, negative_bios = create_batch(
         batch_size, subjects, subject_samples, biomech_dim, device, dataset, args=args
     )
     if len(anchors) == 0:
@@ -107,7 +169,9 @@ def evaluate(encoder, subjects, subject_samples, biomech_dim, device, dataset, b
     anchor_bio_batch = torch.tensor(np.stack(anchor_bios), device=device, dtype=torch.float32)
     positive_bio_batch = torch.tensor(np.stack(positive_bios), device=device, dtype=torch.float32)
     negative_bio_batch = torch.tensor(np.stack(negative_bios), device=device, dtype=torch.float32)
-
+    anchor_metadata_batch = torch.tensor(np.stack(anchor_metadatas), device=device, dtype=torch.float32)
+    positive_metadata_batch = torch.tensor(np.stack(positive_metadatas), device=device, dtype=torch.float32)
+    negative_metadata_batch = torch.tensor(np.stack(negative_metadatas), device=device, dtype=torch.float32)
     with torch.no_grad():
         anchor_emb = F.normalize(encoder(anchor_batch, anchor_bio_batch), dim=1)
         positive_emb = F.normalize(encoder(positive_batch, positive_bio_batch), dim=1)
@@ -244,7 +308,15 @@ def main():
     loader = dataset_183_retarget.retargeted183_data_loader(data_dir=args.dataset_path, num_workers=4, pre_load=True)
 
     encoder = model.vqvae.encoder
-
+    for value in loader.dataset.subject_metadata.values():
+        sport_list.add(value['sport'])
+        level_list.add(value['level'])
+        injury_types.update(value['injuries'])
+    sport_list = sorted(list(sport_list))
+    level_list = sorted(list(level_list))
+    # Filter out NaN values and keep only valid injury types
+    injury_types = sorted([a for a in injury_types if a is not None and not (isinstance(a, float) and np.isnan(a))])
+    inj_idx = {a:i for i,a in enumerate(injury_types)}
     subject_samples = defaultdict(list)
     with torch.no_grad():
         for i, batch in enumerate(tqdm(loader, desc="Encoding Motions")):
@@ -333,11 +405,14 @@ def main():
         anchor_bio_batch = torch.tensor(np.stack(anchor_bios), device=device, dtype=torch.float32)
         positive_bio_batch = torch.tensor(np.stack(positive_bios), device=device, dtype=torch.float32)
         negative_bio_batch = torch.tensor(np.stack(negative_bios), device=device, dtype=torch.float32)
+        anchor_metadata_batch = torch.tensor(np.stack(anchor_metadatas), device=device, dtype=torch.float32)
+        positive_metadata_batch = torch.tensor(np.stack(positive_metadatas), device=device, dtype=torch.float32)
+        negative_metadata_batch = torch.tensor(np.stack(negative_metadatas), device=device, dtype=torch.float32)
 
         encoder.train()
-        anchor_emb = F.normalize(encoder(anchor_batch, anchor_bio_batch), dim=1)
-        positive_emb = F.normalize(encoder(positive_batch, positive_bio_batch), dim=1)
-        negative_emb = F.normalize(encoder(negative_batch, negative_bio_batch), dim=1)
+        anchor_emb = F.normalize(encoder(anchor_batch, anchor_bio_batch, anchor_metadata_batch), dim=1)
+        positive_emb = F.normalize(encoder(positive_batch, positive_bio_batch, positive_metadata_batch), dim=1)
+        negative_emb = F.normalize(encoder(negative_batch, negative_bio_batch, negative_metadata_batch), dim=1)
 
         loss = loss_fn(anchor_emb, positive_emb, negative_emb)
         optimizer.zero_grad()

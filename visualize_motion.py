@@ -4,11 +4,11 @@ import time
 
 # Load a subject's motion from a .b3d file using nimblephysics
 #b3d_path = "/home/mnt/datasets/AddBiomechanics/train/No_Arm/Carter2023_Formatted_No_Arm/P003_split3/P003_split3.b3d"  # <-- Update this path
-b3d_path = "/home/mnt/datasets/183_retargeted/1195.b3d"  # <-- Update this path
+b3d_path = "/home/mnt/datasets/183_retargeted/927.b3d"  # <-- Update this path
 
 # Use SubjectOnDisk to read the first trial's poses
 subject = nimble.biomechanics.SubjectOnDisk(b3d_path)
-trial_idx = 1
+trial_idx = 16
 trial_length = subject.getTrialLength(trial_idx)
 frames = subject.readFrames(
     trial=trial_idx,
@@ -102,7 +102,7 @@ rajagopal_opensim = nimble.RajagopalHumanBodyModel()
 skeleton = rajagopal_opensim.skeleton
 gui.nativeAPI().renderSkeleton(skeleton)
 
-timestep = 1.0 / 240.0
+timestep = 1.0 / 120.0
 # timestep = subject.getTrialTimestep(trial_idx) 
 
 # Animate the motion in a loop forever

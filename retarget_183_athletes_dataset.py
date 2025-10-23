@@ -27,6 +27,7 @@ COLLAPSE_TRIALS_PER_SUBJECT = {
 
 def load_c3d_trial(c3d_path):
     """Load a single C3D file and return markers data."""
+    # Load marker data
     c3d = ezc3d.c3d(c3d_path)
     labels = c3d['parameters']['POINT']['LABELS']['value']
     labels = [l.decode() if isinstance(l, bytes) else l for l in labels]
@@ -460,6 +461,173 @@ def process_trial(trial, node_mapping, offsets_map, base_skeleton, sampling_freq
     ]
     return poses, trial_errors, marker_observations
 
+
+def build_plate_arrays(fps, num_frames, timestep, start_time=0.0):
+    """
+    Build foot body names and concatenated forces/moments/COP arrays for computeValues.
+
+    Returns: foot_body_names, forces_arr, moments_arr, cops_arr
+      - forces_arr shape = (3 * n_plates, num_frames)
+      - moments_arr shape = (3 * n_plates, num_frames)
+      - cops_arr shape = (3 * n_plates, num_frames)
+    """
+    foot_body_names = []
+    forces_list = []
+    moments_list = []
+    cops_list = []
+    frame_times = start_time + np.arange(num_frames) * timestep
+
+    for i, fp in enumerate(fps if fps is not None else []):
+        # derive a readable name
+        name = None
+        for attr in ('getBodyName', 'get_body_name', 'bodyName', 'body_name', 'name', 'getName'):
+            if hasattr(fp, attr):
+                try:
+                    v = getattr(fp, attr)
+                    name = v() if callable(v) else v
+                    if name:
+                        name = str(name)
+                        break
+                except Exception:
+                    name = None
+        if name is None:
+            name = f"force_plate_{i}"
+        foot_body_names.append(name)
+
+        # Access arrays on the ForcePlate object if possible
+        try:
+            f = np.asarray(fp.forces)
+        except Exception:
+            f = np.zeros((0, 3))
+        try:
+            m = np.asarray(fp.moments)
+        except Exception:
+            m = np.zeros((0, 3))
+        try:
+            c = np.asarray(fp.centersOfPressure)
+        except Exception:
+            c = np.zeros((0, 3))
+        try:
+            ts = np.asarray(fp.timestamps)
+        except Exception:
+            ts = None
+
+        def _normalize(arr):
+            if arr is None:
+                return np.zeros((0, 3))
+            arr = np.asarray(arr)
+            if arr.size == 0:
+                return np.zeros((0, 3))
+            if arr.ndim == 1:
+                if arr.size == 3:
+                    return arr.reshape(1, 3)
+                # try to reshape to (-1,3)
+                try:
+                    return arr.reshape(-1, 3)
+                except Exception:
+                    return np.zeros((0, 3))
+            if arr.shape[0] == 3 and arr.shape[1] != 3:
+                return arr.T
+            if arr.shape[1] == 3:
+                return arr
+            try:
+                return arr.reshape(-1, 3)
+            except Exception:
+                return np.zeros((0, 3))
+
+        f = _normalize(f)
+        m = _normalize(m)
+        c = _normalize(c)
+
+        # Resample/interpolate if timestamps provided and differ
+        if ts is not None and getattr(ts, 'size', 0) > 1:
+            ts = ts.astype(float).flatten()
+            def _resample(data):
+                if data.size == 0:
+                    return np.zeros((num_frames, 3))
+                data = np.asarray(data)
+                if data.shape[0] != ts.shape[0] and data.shape[1] == ts.shape[0]:
+                    data = data.T
+                out = np.zeros((num_frames, 3))
+                for col in range(3):
+                    try:
+                        out[:, col] = np.interp(frame_times, ts, data[:, col])
+                    except Exception:
+                        out[:, col] = 0.0
+                return out
+            f = _resample(f)
+            m = _resample(m)
+            c = _resample(c)
+        else:
+            # match lengths via simple interpolation/resampling
+            def _match_len(arr):
+                if arr.shape[0] == num_frames:
+                    return arr
+                if arr.shape[0] == 0:
+                    return np.zeros((num_frames, 3))
+                old_idx = np.linspace(0, 1, arr.shape[0])
+                new_idx = np.linspace(0, 1, num_frames)
+                out = np.zeros((num_frames, 3))
+                for col in range(3):
+                    out[:, col] = np.interp(new_idx, old_idx, arr[:, col])
+                return out
+            f = _match_len(f)
+            m = _match_len(m)
+            c = _match_len(c)
+
+        forces_list.append(f.T)
+        moments_list.append(m.T)
+        cops_list.append(c.T)
+
+    if forces_list:
+        forces_arr = np.vstack(forces_list)
+    else:
+        forces_arr = np.zeros((0, num_frames))
+    if moments_list:
+        moments_arr = np.vstack(moments_list)
+    else:
+        moments_arr = np.zeros((0, num_frames))
+    if cops_list:
+        cops_arr = np.vstack(cops_list)
+    else:
+        cops_arr = np.zeros((0, num_frames))
+
+    return foot_body_names, forces_arr, moments_arr, cops_arr
+
+
+def find_foot_body_names(skel, num_needed=2):
+    """Find candidate foot body names from the skeleton. Returns up to num_needed names.
+
+    Strategy: prefer bodies whose names match common foot-related substrings; fall back
+    to the last N body node names if none match.
+    """
+    names = []
+    try:
+        n = skel.getNumBodyNodes()
+        for i in range(n):
+            try:
+                nm = skel.getBodyNode(i).getName()
+            except Exception:
+                try:
+                    nm = skel.getBody(i).getName()
+                except Exception:
+                    nm = None
+            if nm:
+                names.append(str(nm))
+    except Exception:
+        return []
+
+    # common foot-related tokens
+    tokens = re.compile(r'calcn|calc|talus|toes|foot|heel|metatarsal|mt[0-9]', re.I)
+    candidates = [nm for nm in names if tokens.search(nm)]
+    if len(candidates) >= num_needed:
+        return candidates[:num_needed]
+
+    # fallback: try to use nodes from the end of the list (often distal bodies)
+    if len(names) >= num_needed:
+        return names[-num_needed:]
+    return names
+
 def process_subject(args):
     """Process a single subject and save to B3D format."""
     ppid, base_directory, subject_info, node_mapping, output_dir, rajagopal_osim_path = args
@@ -524,22 +692,143 @@ def process_subject(args):
         b3d_trial.setTrialLength(poses.shape[1])
         b3d_trial.setTimestep(1.0 / float(sampling_frequency))
         b3d_trial.setMarkerObservations(marker_observations)
-        b3d_trial.setForcePlates([])
-        trial_pass = b3d_trial.addPass()
-        trial_pass.setType(nimble.biomechanics.ProcessingPassType.KINEMATICS)
-        trial_pass.setPoses(poses)
-        
+
+        # Best-effort: try to load raw C3D force plate data for this trial so the
+        # b3d contains force plate definitions. This uses Nimble's C3DLoader when
+        # available. If it fails we continue with empty force plates.
+        force_plates = []
+        try:
+            c3d_data = nimble.biomechanics.C3DLoader.loadC3D(trial['path'])
+            force_plates = c3d_data.forcePlates
+            if force_plates:
+                try:
+                    b3d_trial.setForcePlates(force_plates)
+                except Exception:
+                    # Some Nimble versions expect a different proto type; ignore if it fails
+                    logging.debug(f"Could not attach force plates directly for {trial['path']}")
+        except Exception:
+            # loader not available or C3D couldn't be read; leave empty
+            force_plates = []
+
+        # Prepare plate arrays for computeValues
         num_frames = poses.shape[1]
-        trial_pass.computeValues(
+        foot_body_names, forces_arr, moments_arr, cops_arr = build_plate_arrays(
+            force_plates, num_frames, 1.0 / float(sampling_frequency)
+        )
+
+        # Validate foot body names against the skeleton; if they don't exist,
+        # try to pick plausible foot bodies from the skeleton as a fallback.
+        try:
+            valid_names = []
+            for name in foot_body_names:
+                try:
+                    # check presence via getBodyNode/getBody
+                    found = False
+                    try:
+                        _ = base_skeleton.getBodyNode(name)
+                        found = True
+                    except Exception:
+                        try:
+                            _ = base_skeleton.getBody(name)
+                            found = True
+                        except Exception:
+                            found = False
+                    if found:
+                        valid_names.append(name)
+                    else:
+                        logging.warning(f"Foot body name '{name}' not found in skeleton for subject {ppid}; will attempt fallback")
+                except Exception:
+                    logging.debug(f"Error while validating foot body name '{name}'")
+            if len(valid_names) < len(foot_body_names):
+                # try to find candidate foot bodies from the skeleton
+                candidates = find_foot_body_names(base_skeleton, num_needed=len(foot_body_names))
+                if candidates:
+                    logging.info(f"Replacing foot body names {foot_body_names} with skeleton candidates {candidates} for subject {ppid}")
+                    foot_body_names = candidates
+                else:
+                    logging.warning(f"Could not find suitable foot body names in skeleton for subject {ppid}; computeValues may skip dynamics")
+        except Exception:
+            logging.debug("Failed to validate or replace foot body names against skeleton")
+
+        # If there are exactly two force plates and the common mapping is known
+        # in this dataset, prefer mapping -> left/right calcaneus (calcn_l, calcn_r)
+        # if those body nodes exist on the skeleton. This overrides placeholder
+        # names like 'force_plate_0'.
+        try:
+            if force_plates is not None and len(force_plates) == 2:
+                preferred = ['calcn_l', 'calcn_r']
+                ok = True
+                for nm in preferred:
+                    try:
+                        _ = base_skeleton.getBodyNode(nm)
+                    except Exception:
+                        try:
+                            _ = base_skeleton.getBody(nm)
+                        except Exception:
+                            ok = False
+                            break
+                if ok:
+                    foot_body_names = preferred
+                    logging.info(f"Using dataset mapping of plates->bodies: {foot_body_names} for subject {ppid}")
+        except Exception:
+            pass
+
+        # KINEMATICS pass
+        kin_pass = b3d_trial.addPass()
+        kin_pass.setType(nimble.biomechanics.ProcessingPassType.KINEMATICS)
+        kin_pass.setPoses(poses)
+        kin_pass.computeValues(
             base_skeleton,
             1.0 / float(sampling_frequency),
             poses,
-            [],
-            np.zeros((0, num_frames)),
-            np.zeros((0, num_frames)),
-            np.zeros((0, num_frames)),
+            foot_body_names,
+            forces_arr,
+            moments_arr,
+            cops_arr,
             rootHistoryLen=10,
             rootHistoryStride=3)
+
+        # DYNAMICS pass: include a dynamics pass entry (best-effort). If raw
+        # force-plate arrays are available they should be supplied here; for
+        # now we call computeValues with empty sensor arrays to ensure the pass
+        # is present in the B3D.
+        try:
+            dyn_pass = b3d_trial.addPass()
+            dyn_pass.setType(nimble.biomechanics.ProcessingPassType.DYNAMICS)
+            dyn_pass.setPoses(poses)
+            dyn_pass.computeValues(
+                base_skeleton,
+                1.0 / float(sampling_frequency),
+                poses,
+                foot_body_names,
+                forces_arr,
+                moments_arr,
+                cops_arr,
+                rootHistoryLen=10,
+                rootHistoryStride=3)
+        except Exception:
+            logging.debug(f"Failed to create dynamics pass for subject {ppid} trial {trial['name']}")
+
+        # LOW_PASS_FILTER pass: many pipelines apply a low-pass filter after
+        # kinematics/dynamics. Add a pass marker with the same poses so the
+        # output appears in the B3D (the actual filtered poses may be identical
+        # to kinematics here unless you compute a filtered result).
+        try:
+            lp_pass = b3d_trial.addPass()
+            lp_pass.setType(nimble.biomechanics.ProcessingPassType.LOW_PASS_FILTER)
+            lp_pass.setPoses(poses)
+            lp_pass.computeValues(
+                base_skeleton,
+                1.0 / float(sampling_frequency),
+                poses,
+                foot_body_names,
+                forces_arr,
+                moments_arr,
+                cops_arr,
+                rootHistoryLen=10,
+                rootHistoryStride=3)
+        except Exception:
+            logging.debug(f"Failed to create low-pass filter pass for subject {ppid} trial {trial['name']}")
             
         # Attach Rajagopal osim text if available
         try:

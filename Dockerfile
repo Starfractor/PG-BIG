@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
 
-WORKDIR /BIGE
+WORKDIR /PG-BIG
 
 # System Setup
 RUN apt-get update && \
@@ -19,8 +19,8 @@ ENV PATH="/opt/conda/bin:$PATH"
 RUN /opt/conda/bin/conda init bash
 
 # Set default environment
-ENV CONDA_DEFAULT_ENV=BIGE
-ENV PATH="/opt/conda/envs/BIGE/bin:/opt/conda/bin:$PATH"
+ENV CONDA_DEFAULT_ENV=PG-BIG
+ENV PATH="/opt/conda/envs/PG-BIG/bin:/opt/conda/bin:$PATH"
 
 RUN docker system prune -af
 RUN docker volume prune -f
@@ -32,16 +32,16 @@ RUN conda env create -f environment.yaml && \
     rm -rf /root/.cache/pip
 
 # Copy environment files and create conda environments
-COPY environment.yaml opencap-processing.yaml .
+COPY environment.yaml opensim-processing.yaml .
 RUN conda env create -f environment.yaml && \
-    conda env create -f opencap-processing.yaml && \
+    conda env create -f opensim-processing.yaml && \
     conda clean -afy && \
     rm -rf /root/.cache/pip
 
 # Set environment variables for conda
-SHELL ["conda", "run", "-n", "BIGE", "/bin/bash", "-c"]
+SHELL ["conda", "run", "-n", "PG-BIG", "/bin/bash", "-c"]
 
 # Copy repository
 COPY . .
 
-ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "BIGE", "python"]
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "PG-BIG", "python"]
